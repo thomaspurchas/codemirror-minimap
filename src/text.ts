@@ -1,52 +1,69 @@
 import { LineBasedState } from "./linebasedstate";
 import { Highlighter, highlightTree } from "@lezer/highlight";
-import { ChangedRange, Tree, TreeFragment } from "@lezer/common";
-import { highlightingFor, language } from "@codemirror/language";
+import { highlightingFor, forceParsing, syntaxTree } from "@codemirror/language";
 import { EditorView, ViewUpdate } from "@codemirror/view";
 import { DrawContext } from "./types";
 import { Config, Options, Scale } from "./Config";
 import { LinesState, foldsChanged } from "./LinesState";
+import { EditorState } from "@codemirror/state";
 import crelt from "crelt";
-import { ChangeSet, EditorState } from "@codemirror/state";
 
 type TagSpan = { text: string; tags: string };
 type FontInfo = { color: string; font: string; lineHeight: number };
 
 export class TextState extends LineBasedState<Array<TagSpan>> {
-  private _previousTree: Tree | undefined;
+  private _previousParsePos: number = 0;
   private _displayText: Required<Options>["displayText"] | undefined;
   private _fontInfoMap: Map<string, FontInfo> = new Map();
   private _themeClasses: Set<string> | undefined;
   private _highlightingCallbackId: number | undefined;
+  private _parseCallbackId: number | undefined;
+  private _updateMapCallbackId: number | undefined;
+  private _updateCallbackId: number | undefined;
 
   public constructor(view: EditorView) {
     super(view);
 
     this._themeClasses = new Set(view.dom.classList.values());
 
-    if (view.state.facet(Config).enabled) {
-      this.updateImpl(view.state);
-    }
+    // if (view.state.facet(Config).enabled) {
+    //   // Use setTimeout to break mini-map rendering into next frame
+    //   // to prevent the UI from getting stuck for too long.
+    //   setTimeout(() => this.updateImpl(view.state, view));
+    // }
   }
 
   private shouldUpdate(update: ViewUpdate) {
     // If the doc changed
     if (update.docChanged) {
+      if (update.startState.doc.length < update.state.doc.length) {
+        for (let i = update.startState.doc.lines; i <= update.state.doc.lines; i++) {
+          // this.map.delete(i);
+        }
+      }
+      return true;
+    }
+
+    // If the parser has made more progress
+    if (syntaxTree(update.state).length > this._previousParsePos) {
       return true;
     }
 
     // If configuration settings changed
     if (update.state.facet(Config) !== update.startState.facet(Config)) {
+      this.map.clear();
       return true;
     }
 
     // If the theme changed
     if (this.themeChanged()) {
+      this.map.clear();
       return true;
     }
 
     // If the folds changed
     if (foldsChanged(update.transactions)) {
+      this.map.clear();
       return true;
     }
 
@@ -58,18 +75,18 @@ export class TextState extends LineBasedState<Array<TagSpan>> {
       return;
     }
 
-    if (this._highlightingCallbackId) {
-      typeof window.requestIdleCallback !== "undefined"
-        ? cancelIdleCallback(this._highlightingCallbackId)
-        : clearTimeout(this._highlightingCallbackId);
-    }
+    this.cancelScheduledIdleCallback(this._highlightingCallbackId);
+    this.cancelScheduledIdleCallback(this._parseCallbackId);
+    this.cancelScheduledIdleCallback(this._updateMapCallbackId);
 
-    this.updateImpl(update.state, update.changes);
+    // Perform update in an idle callback because mini-map
+    // calculations can be expensive
+    this._updateCallbackId = this.scheduleIdleCallback((deadline?: IdleDeadline) => {
+      this.updateImpl(update.state, update.view, deadline);
+    }, { timeout: 0 })
   }
 
-  private updateImpl(state: EditorState, changes?: ChangeSet) {
-    this.map.clear();
-
+  private updateImpl(state: EditorState, view: EditorView, deadline?: IdleDeadline) {
     /* Store display text setting for rendering */
     this._displayText = state.facet(Config).displayText;
 
@@ -78,36 +95,18 @@ export class TextState extends LineBasedState<Array<TagSpan>> {
       this._fontInfoMap.clear();
     }
 
-    /* Incrementally parse the tree based on previous tree + changes */
-    let treeFragments: ReadonlyArray<TreeFragment> | undefined = undefined;
-    if (this._previousTree && changes) {
-      const previousFragments = TreeFragment.addTree(this._previousTree);
-
-      const changedRanges: Array<ChangedRange> = [];
-      changes.iterChangedRanges((fromA, toA, fromB, toB) =>
-        changedRanges.push({ fromA, toA, fromB, toB })
-      );
-
-      treeFragments = TreeFragment.applyChanges(
-        previousFragments,
-        changedRanges
-      );
-    }
-
-    /* Parse the document into a lezer tree */
-    const docToString = state.doc.toString();
-    const parser = state.facet(language)?.parser;
-    const tree = parser ? parser.parse(docToString, treeFragments) : undefined;
-    this._previousTree = tree;
-
-    /* Highlight the document, and store the text and tags for each line */
-    const highlighter: Highlighter = {
-      style: (tags) => highlightingFor(state, tags),
-    };
-
-    let highlights: Array<{ from: number; to: number; tags: string }> = [];
+    /* Get the existing parsed tree, which is likely incomplete as parsing 
+    takes time. We keep updating the mini-map highlights as parsing
+    continues in the background 
+    
+    This approach ensure that parsing and highlighting don't stall the
+    entire UI while parsing is happening */
+    const tree = syntaxTree(state);
 
     if (tree) {
+      // Update the parse distance so we can detect when the parser has made progress
+      this._previousParsePos = tree.length;
+
       /**
        * The viewport renders a few extra lines above and below the editor view. To approximate
        * the lines visible in the minimap, we multiply the lines in the viewport by the scale multipliers.
@@ -155,6 +154,14 @@ export class TextState extends LineBasedState<Array<TagSpan>> {
         vpLineBottom + Math.floor(mmLineCount - mmLineRatio),
         state.doc.lines
       );
+      const mmTo = state.doc.line(mmLineBottom).to
+
+      /* Highlight parsed sections of the document, and store the text and tags for each line */
+      const highlighter: Highlighter = {
+        style: (tags) => highlightingFor(state, tags),
+      };
+
+      let highlights: Array<{ from: number; to: number; tags: string }> = [];
 
       // Highlight the in-view lines synchronously
       highlightTree(
@@ -166,97 +173,145 @@ export class TextState extends LineBasedState<Array<TagSpan>> {
         state.doc.line(mmLineTop).from,
         state.doc.line(mmLineBottom).to
       );
-    }
 
-    // Update the map
-    this.updateMapImpl(state, highlights);
+      // Update the map
+      this.updateMap(state, highlights, deadline);
 
-    // Highlight the entire tree in an idle callback
-    highlights = [];
-    const highlightingCallback = () => {
-      if (tree) {
+      // Force parsing the rest of the mm in an idle callback
+      const parseCallback = (deadline?: IdleDeadline) => {
+        // Force the parsing till the bottom of the mmView
+        // but only within the time allotted by the idle callback
+        if (forceParsing(view, mmTo, deadline?.timeRemaining())) {
+          this._parseCallbackId = undefined;
+        } else {
+          this._parseCallbackId = this.scheduleIdleCallback(parseCallback);
+        }
+      }
+      // Schedule callback with aggressive timeout to ensure that parsing of
+      // text within the mini-map happens promptly
+      this._parseCallbackId = this.scheduleIdleCallback(parseCallback, { timeout: 0 })
+
+      // Highlight the entire tree in an idle callback
+      highlights = [];
+      const highlightingCallback = (deadline?: IdleDeadline) => {
         highlightTree(tree, highlighter, (from, to, tags) => {
           highlights.push({ from, to, tags });
         });
-        this.updateMapImpl(state, highlights);
+        this.updateMap(state, highlights, deadline);
         this._highlightingCallbackId = undefined;
-      }
-    };
-    this._highlightingCallbackId =
-      typeof window.requestIdleCallback !== "undefined"
-        ? requestIdleCallback(highlightingCallback)
-        : setTimeout(highlightingCallback);
+      };
+      this._highlightingCallbackId = this.scheduleIdleCallback(highlightingCallback)
+    }
   }
 
-  private updateMapImpl(
+  private scheduleIdleCallback(callback: (deadline?: IdleDeadline) => void, options?: IdleRequestOptions): number {
+    return typeof window.requestIdleCallback !== "undefined"
+      ? requestIdleCallback(callback, options)
+      : setTimeout(callback);
+  }
+
+  private cancelScheduledIdleCallback(id?: number) {
+    if (id !== undefined && id === null) {
+      typeof window.requestIdleCallback !== "undefined"
+        ? cancelIdleCallback(id)
+        : clearTimeout(id);
+    }
+  }
+
+  private updateMap(
     state: EditorState,
-    highlights: Array<{ from: number; to: number; tags: string }>
+    highlights: Array<{ from: number; to: number; tags: string }>,
+    deadline?: IdleDeadline // If passed a deadline, then updateMap will be called in an idle callback
   ) {
-    this.map.clear();
+    if (this._updateMapCallbackId) {
+      this.cancelScheduledIdleCallback(this._updateMapCallbackId);
+    }
 
     const docToString = state.doc.toString();
     const highlightsIterator = highlights.values();
     let highlightPtr = highlightsIterator.next();
+    let startLine = 0;
 
-    for (const [index, line] of state.field(LinesState).entries()) {
-      const spans: Array<TagSpan> = [];
+    const updateMapCallback = (deadline?: IdleDeadline) => {
+      for (const [index, line] of state.field(LinesState).slice(startLine).entries()) {
+        const spans: Array<TagSpan> = [];
 
-      for (const span of line) {
-        // Skip if it's a 0-length span
-        if (span.from === span.to) {
-          continue;
-        }
-
-        // Append a placeholder for a folded span
-        if (span.folded) {
-          spans.push({ text: "…", tags: "" });
-          continue;
-        }
-
-        let position = span.from;
-        while (!highlightPtr.done && highlightPtr.value.from < span.to) {
-          const { from, to, tags } = highlightPtr.value;
-
-          // Iterate until our highlight is over the current span
-          if (to < position) {
-            highlightPtr = highlightsIterator.next();
+        for (const span of line) {
+          // Skip if it's a 0-length span
+          if (span.from === span.to) {
             continue;
           }
 
-          // Append unstyled text before the highlight begins
-          if (from > position) {
-            spans.push({ text: docToString.slice(position, from), tags: "" });
+          // Append a placeholder for a folded span
+          if (span.folded) {
+            spans.push({ text: "…", tags: "" });
+            continue;
           }
 
-          // A highlight may start before and extend beyond the current span
-          const start = Math.max(from, span.from);
-          const end = Math.min(to, span.to);
+          let position = span.from;
+          while (!highlightPtr.done && highlightPtr.value.from < span.to) {
+            const { from, to, tags } = highlightPtr.value;
 
-          // Append the highlighted text
-          spans.push({ text: docToString.slice(start, end), tags });
-          position = end;
+            // Iterate until our highlight is over the current span
+            if (to < position) {
+              highlightPtr = highlightsIterator.next();
+              continue;
+            }
 
-          // If the highlight continues beyond this span, break from this loop
-          if (to > end) {
-            break;
+            // Append unstyled text before the highlight begins
+            if (from > position) {
+              spans.push({ text: docToString.slice(position, from), tags: "" });
+            }
+
+            // A highlight may start before and extend beyond the current span
+            const start = Math.max(from, span.from);
+            const end = Math.min(to, span.to);
+
+            // Append the highlighted text
+            spans.push({ text: docToString.slice(start, end), tags });
+            position = end;
+
+            // If the highlight continues beyond this span, break from this loop
+            if (to > end) {
+              break;
+            }
+
+            // Otherwise, move to the next highlight
+            highlightPtr = highlightsIterator.next();
           }
 
-          // Otherwise, move to the next highlight
-          highlightPtr = highlightsIterator.next();
+          // If there are remaining spans that did not get highlighted, append them unstyled
+          if (position !== span.to) {
+            spans.push({
+              text: docToString.slice(position, span.to),
+              tags: "",
+            });
+          }
         }
 
-        // If there are remaining spans that did not get highlighted, append them unstyled
-        if (position !== span.to) {
-          spans.push({
-            text: docToString.slice(position, span.to),
-            tags: "",
-          });
+        // Lines are indexed beginning at 1 instead of 0
+        const lineNumber = startLine + index + 1;
+        this.map.set(lineNumber, spans);
+
+        // If we've run out of time. Break the loop and schedule a continuation
+        // later
+        if (deadline && deadline?.timeRemaining() <= 0) {
+          startLine += index;
+          this._updateMapCallbackId = this.scheduleIdleCallback(updateMapCallback,
+            { timeout: deadline.didTimeout ? 0 : undefined });
+          return;
         }
+        this._updateMapCallbackId = undefined;
       }
+    }
 
-      // Lines are indexed beginning at 1 instead of 0
-      const lineNumber = index + 1;
-      this.map.set(lineNumber, spans);
+    if (!deadline) {
+      // If not called with a deadline, then do a blocking update
+      updateMapCallback();
+    } else {
+      // Otherwise perform an async update
+      this._updateMapCallbackId = this.scheduleIdleCallback(updateMapCallback,
+        { timeout: deadline.didTimeout ? 0 : undefined });
     }
   }
 
